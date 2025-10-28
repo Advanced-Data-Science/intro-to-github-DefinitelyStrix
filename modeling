@@ -1,0 +1,99 @@
+import os, json
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.inspection import permutation_importance
+
+try:
+    import shap
+    SHAP_OK = True
+except Exception:
+    SHAP_OK = False
+
+TARGET_DEFAULT = "final_result"
+
+def split_features(df, target):
+    y = df[target].astype("category")
+    X = df.drop(columns=[target])
+    num_cols = X.select_dtypes(include=[np.number]).columns.tolist()
+    cat_cols = [c for c in X.columns if c not in num_cols]
+    return X, y, num_cols, cat_cols
+
+def build_preprocess(num_cols, cat_cols):
+    pre = ColumnTransformer([
+        ("num", StandardScaler(with_mean=False), num_cols),
+        ("cat", OneHotEncoder(handle_unknown="ignore"), cat_cols),
+    ])
+    return pre
+
+def _ensure_dir(p): os.makedirs(p, exist_ok=True)
+
+def train_models(model_table_path: str, outdir: str, target: str = TARGET_DEFAULT):
+    _ensure_dir(outdir)
+    df = pd.read_csv(model_table_path)
+    df = df.dropna(subset=[target]).copy()
+
+    X, y, num_cols, cat_cols = split_features(df, target)
+    pre = build_preprocess(num_cols, cat_cols)
+
+    models = {
+        "logreg": Pipeline([("pre", pre), ("clf", LogisticRegression(max_iter=1000, class_weight="balanced", multi_class="ovr"))]),
+        "rf": Pipeline([("pre", pre), ("clf", RandomForestClassifier(n_estimators=300, class_weight="balanced", random_state=0))]),
+        "gbc": Pipeline([("pre", pre), ("clf", GradientBoostingClassifier(random_state=0))]),
+    }
+
+    X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+    results = {}
+
+    for name, pipe in models.items():
+        pipe.fit(X_tr, y_tr)
+        preds = pipe.predict(X_te)
+        try:
+            proba = pipe.predict_proba(X_te)
+            auc = roc_auc_score(y_te, proba, multi_class="ovr")
+        except Exception:
+            auc = None
+
+        rep = classification_report(y_te, preds, output_dict=True, zero_division=0)
+        cm = confusion_matrix(y_te, preds).tolist()
+        results[name] = {"auc_ovr": auc, "report": rep, "confusion_matrix": cm}
+
+        with open(os.path.join(outdir, f"metrics_{name}.json"), "w") as f:
+            json.dump(results[name], f, indent=2)
+
+        reports_dir = os.path.join(os.path.dirname(outdir), "reports")
+        os.makedirs(reports_dir, exist_ok=True)
+
+        try:
+            ohe = pipe.named_steps["pre"].named_transformers_["cat"]
+            cat_names = list(ohe.get_feature_names_out(cat_cols)) if hasattr(ohe, "get_feature_names_out") else []
+            feature_names = list(num_cols) + cat_names
+
+            X_te_trans = pipe.named_steps["pre"].transform(X_te)
+
+            if SHAP_OK and hasattr(pipe.named_steps["clf"], "predict_proba"):
+                explainer = shap.Explainer(pipe.named_steps["clf"])
+                shap_vals = explainer(X_te_trans)
+                plt.figure()
+                shap.plots.beeswarm(shap_vals, show=False, max_display=20)
+                plt.title(f"SHAP Summary — {name}")
+                plt.tight_layout()
+                plt.savefig(os.path.join(reports_dir, f"SHAP_{name}.png"), dpi=140)
+                plt.close()
+            else:
+                r = permutation_importance(pipe.named_steps["clf"], X_te_trans, y_te, n_repeats=10, random_state=0)
+                k = min(len(feature_names), len(r.importances_mean))
+                imp = pd.DataFrame({"feature": feature_names[:k], "importance": r.importances_mean[:k]})
+                imp.sort_values("importance", ascending=False).to_csv(os.path.join(outdir, f"feature_importance_{name}.csv"), index=False)
+        except Exception:
+            pass
+
+    return results
